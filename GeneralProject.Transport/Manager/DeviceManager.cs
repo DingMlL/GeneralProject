@@ -6,6 +6,7 @@ using GeneralProject.Transport.Parser;
 using GeneralProject.Transport.Proxy;
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 
@@ -118,7 +119,15 @@ namespace GeneralProject.Transport.Manager
             {
                 queue.LogEvent -= (msg, ex) => { };
                 queue.Dispose();
-                OnLog($"连接 {connectionId} 已移除");
+
+                // 移除该连接下的所有设备
+                var deviceKeys = _devices.Keys.Where(k => k.StartsWith(connectionId + ":")).ToList();
+                foreach (var key in deviceKeys)
+                {
+                    _devices.TryRemove(key, out _);
+                }
+
+                OnLog($"连接 {connectionId} 已移除，同时移除了 {deviceKeys.Count} 个设备");
                 return true;
             }
             return false;
@@ -237,23 +246,36 @@ namespace GeneralProject.Transport.Manager
             if (string.IsNullOrEmpty(connectionConfig))
                 throw new ArgumentException("连接配置不能为空", nameof(connectionConfig));
 
-
             var key = $"{connectionId}:{deviceId}";
 
-            // 1. 检查设备池
+            // ===== 1. 检查设备池 =====
             if (_devices.TryGetValue(key, out var existing) && existing is TDevice typedExisting)
                 return typedExisting;
 
-            // 2. 解析配置
-            var config = ConnectionConfigParser.Parse(connectionConfig);
+            // ===== 2. 检查连接是否已存在 =====
+            // 【关键修复】连接存在时，直接使用已有的连接，不创建新通道
+            if (_connections.TryGetValue(connectionId, out var existingQueue))
+            {
+                // 连接已存在，直接创建设备（复用连接）
+                var devices = CreateDeviceInstance<TDevice>(existingQueue, deviceId);
+                existingQueue.RegisterDevice(devices);
+                if (!_devices.TryAdd(key, devices))
+                {
+                    (devices as IDisposable)?.Dispose();
+                    throw new InvalidOperationException($"注册设备 {key} 失败");
+                }
+                OnLog($"设备 {deviceId}（类型 {typeof(TDevice).Name}）已复用连接 {connectionId}");
+                return devices;
+            }
 
-            // 3. 创建通道
+            // ===== 3. 连接不存在，创建新连接 =====
+            var config = ConnectionConfigParser.Parse(connectionConfig);
             var channel = CreateChannelFromConfig(config);
 
-            // 4. 创建解析器
+            // ===== 4. 创建解析器 =====
             var parser = CreateParserFromAttribute<TDevice>();
 
-            // 5. 打开通道
+            // ===== 5. 打开通道 =====
             try
             {
                 channel.OpenAsync().GetAwaiter().GetResult();
@@ -264,13 +286,13 @@ namespace GeneralProject.Transport.Manager
                 throw new InvalidOperationException($"打开通道失败: {connectionConfig}", ex);
             }
 
-            // 6. 获取或创建连接队列器
+            // ===== 6. 创建连接队列器 =====
             var queue = GetOrCreateConnection(connectionId, channel, parser);
 
-            // 7. 创建设备实例
+            // ===== 7. 创建设备实例 =====
             var device = CreateDeviceInstance<TDevice>(queue, deviceId);
 
-            // 8. 注册设备
+            // ===== 8. 注册设备 =====
             queue.RegisterDevice(device);
             if (!_devices.TryAdd(key, device))
             {
@@ -387,6 +409,7 @@ namespace GeneralProject.Transport.Manager
         private void OnLog(string message, Exception? ex = null)
         {
             LogEvent?.Invoke($"[DeviceManager] {message}", ex);
+            Debug.WriteLine($"[DeviceManager] {message}", ex);
         }
 
         // ========== 资源释放 ==========

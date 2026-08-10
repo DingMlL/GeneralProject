@@ -40,11 +40,30 @@ namespace GeneralProject.UIDemo
         {
             if (_isConnected)
             {
-                // 断开连接
-                StopPolling();
+                // ===== 1. 停止轮询并等待完成 =====
+                if (_isPolling)
+                {
+                    StopPolling();
+                    // 等待轮询循环完全退出（最多等待 2 秒）
+                    int waitCount = 0;
+                    while (_isPolling && waitCount < 20)
+                    {
+                        await Task.Delay(100);
+                        waitCount++;
+                    }
+                }
+
+                // ===== 2. 移除连接 =====
                 _deviceManager.RemoveConnection(_connectionId);
                 _isConnected = false;
                 _connectionId = string.Empty;
+
+                // ===== 3. 释放设备代理引用 =====
+                _tempProxy = null;
+                _acProxy = null;
+                _microwaveProxy = null;
+
+                // ===== 4. 重置 UI =====
                 btnConnect.Text = "连接";
                 btnConnect.BackColor = System.Drawing.Color.DeepSkyBlue;
                 lblStatus.Text = "已断开";
@@ -52,7 +71,6 @@ namespace GeneralProject.UIDemo
                 ClearDisplay();
                 return;
             }
-
             string input = txtConnection.Text.Trim();
             if (string.IsNullOrEmpty(input))
             {
@@ -62,12 +80,10 @@ namespace GeneralProject.UIDemo
 
             try
             {
-                // 解析连接参数
                 var (connectionConfig, connectionId) = ParseConnectionString(input);
                 _connectionConfig = connectionConfig;
                 _connectionId = connectionId;
 
-                // 创建设备
                 _tempProxy = await Task.Run(() =>
                     _deviceManager.GetOrCreateDevice<TemperatureHumidityProxy>(
                         _connectionId, "1", _connectionConfig
@@ -92,10 +108,8 @@ namespace GeneralProject.UIDemo
                 lblStatus.Text = $"已连接 ({connectionId})";
                 lblStatus.ForeColor = System.Drawing.Color.Green;
 
-                // 连接成功后立即读取一次
                 await ReadAllDevicesAsync();
 
-                // 如果轮询已勾选，自动启动
                 if (chkPolling.Checked)
                 {
                     StartPolling();
@@ -113,10 +127,8 @@ namespace GeneralProject.UIDemo
 
         private (string connectionConfig, string connectionId) ParseConnectionString(string input)
         {
-            // 判断是 TCP 还是 串口
             if (input.Contains(":"))
             {
-                // TCP: 192.168.1.113:8234
                 var parts = input.Split(':');
                 if (parts.Length == 2 && int.TryParse(parts[1], out int port))
                 {
@@ -124,7 +136,6 @@ namespace GeneralProject.UIDemo
                 }
                 else if (input.StartsWith("COM", StringComparison.OrdinalIgnoreCase))
                 {
-                    // 串口带波特率: COM3:9600
                     var p = input.Split(':');
                     return ($"serial://{p[0]}:{p[1]}", p[0]);
                 }
@@ -132,7 +143,6 @@ namespace GeneralProject.UIDemo
             }
             else if (input.StartsWith("COM", StringComparison.OrdinalIgnoreCase))
             {
-                // 串口: COM3（默认9600）
                 return ($"serial://{input}:9600", input);
             }
             else
@@ -145,11 +155,13 @@ namespace GeneralProject.UIDemo
 
         private async Task ReadAllDevicesAsync()
         {
-            if (!_isConnected) return;
+            // 如果连接已断开或设备代理为空，直接返回
+            if (!_isConnected || _tempProxy == null || _acProxy == null || _microwaveProxy == null)
+                return;
 
             try
             {
-                // 读取送变器温湿度（地址1）
+                // 读取温湿度变送器
                 if (_tempProxy != null)
                 {
                     var temp = await _tempProxy.ReadTemperatureAsync();
@@ -157,7 +169,7 @@ namespace GeneralProject.UIDemo
                     UpdateTempDisplay(temp, humidity);
                 }
 
-                // 读取控制器温湿度（地址2）
+                // 读取空调温湿度（只读温湿度，不读状态）
                 if (_acProxy != null)
                 {
                     var temp = await _acProxy.ReadTemperatureAsync();
@@ -165,7 +177,7 @@ namespace GeneralProject.UIDemo
                     UpdateAcDisplay(temp, humidity);
                 }
 
-                // 读取感应器状态（地址3）
+                // 读取微波探测器
                 if (_microwaveProxy != null)
                 {
                     var alarm = await _microwaveProxy.ReadAlarmStatusAsync();
@@ -174,14 +186,18 @@ namespace GeneralProject.UIDemo
                     UpdateMicrowaveDisplay(alarm, delay, duration);
                 }
 
-                // 更新读取时间
                 lblLastReadTime.Text = $"最后更新: {DateTime.Now:HH:mm:ss}";
+            }
+            catch (ObjectDisposedException)
+            {
+                // 对象已释放，忽略，等待下次连接重建
+                lblStatus.Text = "连接已断开";
+                lblStatus.ForeColor = System.Drawing.Color.Orange;
             }
             catch (Exception ex)
             {
-                // 读取失败不弹窗，只更新状态
                 lblStatus.Text = $"读取异常: {ex.Message}";
-                lblStatus.ForeColor = System.Drawing.Color.Orange;
+                lblStatus.ForeColor = System.Drawing.Color.Red;
             }
         }
 
@@ -199,8 +215,30 @@ namespace GeneralProject.UIDemo
         {
             lblAcTempValue.Text = $"{temp:F1} ℃";
             lblAcHumidityValue.Text = $"{humidity:F1} %";
+            // 状态默认显示 ✅，表示温湿度读取成功
             lblAcStatus.Text = "✅";
             lblAcStatus.ForeColor = System.Drawing.Color.Green;
+        }
+
+        private async Task UpdateAcStatus()
+        {
+            try
+            {
+                var status = await _acProxy!.ReadStatusChannel1Async();
+                lblAcStatus.Text = status switch
+                {
+                    AirConditionerStatus.Stopped => "⏹️ 已停止",
+                    AirConditionerStatus.Cooling => "❄️ 制冷中",
+                    AirConditionerStatus.Heating => "🔥 制热中",
+                    _ => "❓ 未知"
+                };
+                lblAcStatus.ForeColor = System.Drawing.Color.Blue;
+            }
+            catch
+            {
+                lblAcStatus.Text = "❌ 读取失败";
+                lblAcStatus.ForeColor = System.Drawing.Color.Red;
+            }
         }
 
         private void UpdateMicrowaveDisplay(bool alarm, int delay, int duration)
@@ -220,12 +258,203 @@ namespace GeneralProject.UIDemo
             lblAcTempValue.Text = "--";
             lblAcHumidityValue.Text = "--";
             lblAcStatus.Text = "⏳";
+            SetAcFeedback("就绪", System.Drawing.Color.Gray);
 
-            lblMicrowaveAlarm.Text = "⏳";
+            lblMicrowaveAlarm.Text = "--";
             lblMicrowaveDelayValue.Text = "--";
             lblMicrowaveDurationValue.Text = "--";
 
             lblLastReadTime.Text = "未读取";
+        }
+
+        // ============ 空调发射方法 ============
+
+        private async void btnAcSendCooling_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+            SetAcFeedback("正在发送制冷指令...", System.Drawing.Color.Blue);
+
+            try
+            {
+                await _acProxy.SendCoolingOnAsync();
+                SetAcFeedback("✅ 制冷指令发送成功", System.Drawing.Color.Green);
+                await UpdateAcStatus();
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 发送失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        private async void btnAcSendHeating_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+            SetAcFeedback("正在发送制热指令...", System.Drawing.Color.Blue);
+
+            try
+            {
+                await _acProxy.SendHeatingOnAsync();
+                SetAcFeedback("✅ 制热指令发送成功", System.Drawing.Color.Green);
+                await UpdateAcStatus();
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 发送失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        private async void btnAcSendOff_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+            SetAcFeedback("正在发送关机指令...", System.Drawing.Color.Blue);
+
+            try
+            {
+                await _acProxy.SendOffAsync();
+                SetAcFeedback("✅ 关机指令发送成功", System.Drawing.Color.Green);
+                await UpdateAcStatus();
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 发送失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        private async void btnAcSendCustom_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+
+            int index = (int)nudAcSendCustomIndex.Value;
+            SetAcFeedback($"正在发送自定义 {index} 指令...", System.Drawing.Color.Blue);
+
+            try
+            {
+                if (index <= 20)
+                {
+                    await _acProxy.SendCustomAsync(index);
+                }
+                else
+                {
+                    await _acProxy.SendCustomExtendedAsync(index);
+                }
+                SetAcFeedback($"✅ 自定义 {index} 指令发送成功", System.Drawing.Color.Green);
+                await UpdateAcStatus();
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 发送失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        // ============ 空调学习方法 ============
+
+        private async void btnAcLearnCooling_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+
+            SetAcFeedback("📖 正在学习制冷指令（请对准遥控器发射）...", System.Drawing.Color.Blue);
+
+            try
+            {
+                await _acProxy.LearnCoolingAsync(5000);
+                SetAcFeedback("✅ 制冷指令学习成功", System.Drawing.Color.Green);
+            }
+            catch (TimeoutException)
+            {
+                SetAcFeedback("❌ 学习超时，请检查遥控器是否对准", System.Drawing.Color.Red);
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 学习失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        private async void btnAcLearnHeating_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+
+            SetAcFeedback("📖 正在学习制热指令（请对准遥控器发射）...", System.Drawing.Color.Blue);
+
+            try
+            {
+                await _acProxy.LearnHeatingAsync(5000);
+                SetAcFeedback("✅ 制热指令学习成功", System.Drawing.Color.Green);
+            }
+            catch (TimeoutException)
+            {
+                SetAcFeedback("❌ 学习超时，请检查遥控器是否对准", System.Drawing.Color.Red);
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 学习失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        private async void btnAcLearnOff_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+
+            SetAcFeedback("📖 正在学习关机指令（请对准遥控器发射）...", System.Drawing.Color.Blue);
+
+            try
+            {
+                await _acProxy.LearnOffAsync(5000);
+                SetAcFeedback("✅ 关机指令学习成功", System.Drawing.Color.Green);
+            }
+            catch (TimeoutException)
+            {
+                SetAcFeedback("❌ 学习超时，请检查遥控器是否对准", System.Drawing.Color.Red);
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 学习失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        private async void btnAcLearnCustom_Click(object sender, EventArgs e)
+        {
+            if (_acProxy == null) { MessageBox.Show("设备未初始化"); return; }
+
+            int index = (int)nudAcLearnCustomIndex.Value;
+            SetAcFeedback($"📖 正在学习自定义 {index} 指令（请对准遥控器发射）...", System.Drawing.Color.Blue);
+
+            try
+            {
+                if (index <= 20)
+                {
+                    await _acProxy.LearnCustomAsync(index, 5000);
+                }
+                else
+                {
+                    await _acProxy.LearnCustomExtendedAsync(index, 5000);
+                }
+                SetAcFeedback($"✅ 自定义 {index} 指令学习成功", System.Drawing.Color.Green);
+            }
+            catch (TimeoutException)
+            {
+                SetAcFeedback($"❌ 学习超时，请检查遥控器是否对准", System.Drawing.Color.Red);
+            }
+            catch (NotSupportedException)
+            {
+                SetAcFeedback($"❌ 设备不支持自定义 {index}（请检查固件版本）", System.Drawing.Color.Red);
+            }
+            catch (Exception ex)
+            {
+                SetAcFeedback($"❌ 学习失败: {ex.Message}", System.Drawing.Color.Red);
+            }
+        }
+
+        // ============ 空调辅助方法 ============
+
+        private void SetAcFeedback(string message, System.Drawing.Color color)
+        {
+            if (lblAcFeedback.InvokeRequired)
+            {
+                lblAcFeedback.Invoke(new Action(() => SetAcFeedback(message, color)));
+                return;
+            }
+            lblAcFeedback.Text = message;
+            lblAcFeedback.ForeColor = color;
         }
 
         // ============ 轮询控制 ============
@@ -240,7 +469,6 @@ namespace GeneralProject.UIDemo
                 }
                 else
                 {
-                    // 未连接时勾选，提示用户先连接
                     chkPolling.Checked = false;
                     MessageBox.Show("请先点击「连接」按钮建立连接", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
@@ -273,7 +501,6 @@ namespace GeneralProject.UIDemo
 
         private async Task PollingLoop(CancellationToken ct)
         {
-            // 读取间隔：1秒
             int interval = (int)nudPollingInterval.Value * 1000;
 
             while (!ct.IsCancellationRequested && _isConnected && _isPolling)
@@ -286,12 +513,11 @@ namespace GeneralProject.UIDemo
                 {
                     break;
                 }
-                catch (Exception)
+                catch
                 {
-                    // 轮询中的异常静默处理，避免循环中断
+                    // 静默处理
                 }
 
-                // 等待间隔（支持提前取消）
                 try
                 {
                     await Task.Delay(interval, ct);

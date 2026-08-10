@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -186,6 +187,7 @@ namespace GeneralProject.Transport.Core
             int timeoutMs = 3000,
             CommandPriority priority = CommandPriority.Normal)
         {
+
             if (request == null || request.Length == 0)
                 throw new ArgumentException("请求数据不能为空", nameof(request));
 
@@ -393,6 +395,7 @@ namespace GeneralProject.Transport.Core
         {
             try
             {
+
                 // 1. 拆包
                 var frames = _decoder.Decode(data, _parser);
                 if (frames.Count == 0) return;
@@ -425,6 +428,7 @@ namespace GeneralProject.Transport.Core
         /// </summary>
         private void HandleReport(byte[] frame)
         {
+
             string? deviceId = _parser.ExtractDeviceId(frame);
             if (string.IsNullOrEmpty(deviceId))
             {
@@ -455,7 +459,9 @@ namespace GeneralProject.Transport.Core
         /// </summary>
         private void HandleResponse(byte[] frame)
         {
+
             ushort? matchKey = _parser.ExtractMatchKey(frame);
+
             if (!matchKey.HasValue)
             {
                 OnLog($"响应帧：无法提取匹配键，已丢弃");
@@ -464,6 +470,7 @@ namespace GeneralProject.Transport.Core
 
             if (_pendingMap.TryRemove(matchKey.Value, out var operation))
             {
+
                 // 防重入：只有赢家能继续
                 if (operation.TrySetCompleted())
                 {
@@ -490,7 +497,6 @@ namespace GeneralProject.Transport.Core
         }
 
         // ========== 资源释放 ==========
-
         public void Dispose()
         {
             if (_disposed) return;
@@ -498,35 +504,47 @@ namespace GeneralProject.Transport.Core
 
             OnLog("正在释放 ConnectionQueue...");
 
-            _cts.Cancel();
+            // 1. 取消后台任务
+            try { _cts.Cancel(); } catch { }
 
-            // 清理等待字典
-            foreach (var key in _pendingMap.Keys)
-            {
-                if (_pendingMap.TryRemove(key, out var op) && op.TrySetCompleted())
-                {
-                    op.Tcs?.TrySetException(new ObjectDisposedException(nameof(ConnectionQueue)));
-                    op.Callback?.Invoke(null!);
-                    op.Dispose();
-                }
-            }
-
-            // 等待后台任务结束
+            // 2. 等待后台任务结束
             try
             {
-                Task.WaitAll(new[] { _consumerTask, _timeoutScannerTask }, 2000);
+                Task.WaitAll(new[] { _consumerTask, _timeoutScannerTask }, 3000);
             }
             catch { }
 
-            // 解绑通道事件
-            _channel.DataReceived -= OnDataReceived;
-            _channel.Opened -= OnChannelOpened;
-            _channel.Closed -= OnChannelClosed;
-            _channel.ErrorOccurred -= OnChannelError;
+            // 3. 清理等待字典
+            foreach (var key in _pendingMap.Keys.ToList())
+            {
+                if (_pendingMap.TryRemove(key, out var op))
+                {
+                    try { op.Cts?.Cancel(); } catch { }
+                    try { op.Cts?.Dispose(); } catch { }
+                    try { op.Tcs?.TrySetException(new ObjectDisposedException(nameof(ConnectionQueue))); } catch { }
+                    try { op.Callback?.Invoke(null!); } catch { }
+                }
+            }
 
-            _signal.Dispose();
-            _decoder.Dispose();
-            _cts.Dispose();
+            // 4. 解绑通道事件
+            try { _channel.DataReceived -= OnDataReceived; } catch { }
+            try { _channel.Opened -= OnChannelOpened; } catch { }
+            try { _channel.Closed -= OnChannelClosed; } catch { }
+            try { _channel.ErrorOccurred -= OnChannelError; } catch { }
+
+            // 5. 【关键】关闭并释放物理通道
+            try
+            {
+                if (_channel is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
+            }
+            catch { }
+
+            try { _signal.Dispose(); } catch { }
+            try { _decoder.Dispose(); } catch { }
+            try { _cts.Dispose(); } catch { }
 
             OnLog("ConnectionQueue 已释放");
         }

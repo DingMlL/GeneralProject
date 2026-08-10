@@ -106,7 +106,7 @@ namespace GeneralProject.Transport.Devices.Renke
                 // 功能码 0x05, 0x06, 0x0F, 0x10 写操作，响应固定长度 8 字节
                 else if (functionCode == 0x05 || functionCode == 0x06 || functionCode == 0x0F || functionCode == 0x10)
                 {
-                    dataLength = 8;
+                    dataLength = 6;
                 }
                 else
                 {
